@@ -19,6 +19,13 @@ extern long scores[4];
 extern int ranks[4];
 extern Mode currentMode; 
 
+// 音轨自定义配置及实时播放状态追踪变量引用
+extern uint8_t playerVoiceTracks[4];
+extern uint8_t playerBGMTracks[4];
+extern uint8_t defaultBGMTrack;
+extern AudioState currentAudioState;
+extern int activeRiichiTrack;
+
 // 引入核心霍尔立直物理锁定状态数组和公积金池变量声明
 extern bool hasRiichi[4]; 
 extern int riichiPool; // 💥 引入全局立直棒池
@@ -40,10 +47,28 @@ extern void resetAllRiichi();
 extern void updateAllSystem();
 extern String getModeName(Mode mode); 
 
+// 🌐 系统日志缓冲区与在线 Console 引擎
+#define LOG_BUFFER_SIZE 30
+String sysLogBuffer[LOG_BUFFER_SIZE];
+int sysLogHead = 0;
+int sysLogCount = 0;
+
+void addLog(String msg) {
+  Serial.println(msg);
+  sysLogBuffer[sysLogHead] = msg;
+  sysLogHead = (sysLogHead + 1) % LOG_BUFFER_SIZE;
+  if (sysLogCount < LOG_BUFFER_SIZE) sysLogCount++;
+}
+
 // 💥 网页综合模板
 String getPageHTML() {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover'>";
+  html += "<meta name='mobile-web-app-capable' content='yes'>";
+  html += "<meta name='apple-mobile-web-app-capable' content='yes'>";
+  html += "<meta name='apple-mobile-web-app-status-bar-style' content='black-translucent'>";
+  html += "<meta name='theme-color' content='#007BFF'>";
+  html += "<title>立直麻将智能风盘</title>";
   html += "<script src='https://cdn.jsdelivr.net/npm/chart.js'></script>";
   
   html += "<style>body{font-family:sans-serif; text-align:center; background:#f4f4f4; margin:0; padding:15px;}";
@@ -80,6 +105,14 @@ String getPageHTML() {
   html += ".modal-input{width:90%; padding:12px; font-size:18px; margin:15px 0; border:1px solid #ccc; border-radius:6px; text-align:center; box-sizing:border-box;}";
   html += ".modal-btn-group{display:flex; justify-content:space-between; gap:10px;}";
   html += ".m-btn{flex:1; padding:12px; font-size:14px; font-weight:bold; color:white; border:none; border-radius:6px; cursor:pointer;}";
+  html += ".console-panel{background:white; padding:15px; margin:15px auto; width:88%; border-radius:10px; box-shadow:0 4px 8px rgba(0,0,0,0.05); box-sizing:border-box; text-align:left;}";
+  html += ".console-header{display:flex; justify-content:space-between; align-items:center; color:#495057; font-weight:bold; font-size:14px; margin-bottom:8px; border-bottom:1px solid #eee; padding-bottom:5px;}";
+  html += ".console-box{background:#1e1e1e; color:#00ff66; font-family:monospace; font-size:12px; height:150px; overflow-y:auto; padding:10px; border-radius:8px; line-height:1.4;}";
+  html += ".log-line{margin:3px 0; word-break:break-all;}";
+  html += ".audio-panel{background:white; padding:15px; margin:15px auto; width:88%; border-radius:10px; box-shadow:0 4px 8px rgba(0,0,0,0.05); box-sizing:border-box; text-align:left;}";
+  html += ".audio-grid{display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:10px;}";
+  html += ".audio-card{background:#f8f9fa; padding:10px; border-radius:8px; border:1px solid #e9ecef;}";
+  html += ".audio-select{width:100%; padding:6px; margin-top:4px; font-size:12px; border-radius:5px; border:1px solid #ced4da; background:white;}";
   html += "</style>";
   
   // JavaScript 动态注入核心
@@ -87,6 +120,7 @@ String getPageHTML() {
   html += "let myChart = null;";
   html += "let isPlaying = false;"; 
   html += "let activeTargetPlayer = -1;"; 
+  html += "let volDebounceTimer = null;"; 
   
   // 视图切换
   html += "function switchView(view) {";
@@ -135,14 +169,14 @@ String getPageHTML() {
   html += "  fetch('/api/adjust_pool?action=' + action);";
   html += "}";
   
-  // AJAX 0.5秒实时大刷盘核心
+  // AJAX 0.5秒实时大刷盘核心 (合并请求 & 终端智能平滑置底)
   html += "setInterval(function() {";
   html += "  if(document.getElementById('main_view').style.display !== 'none') {";
   html += "    fetch('/api/get_scores').then(r => r.json()).then(data => {";
   html += "      document.getElementById('renchan_val').innerText = data.renchan;";
   html += "      document.getElementById('mode_val').innerText = data.mode_str;"; 
   html += "      document.getElementById('hands_val').innerText = data.total_hands;"; 
-  html += "      document.getElementById('pool_val').innerText = data.pool_sticks;"; // 💥 实时将底层的立直棒总数拉取到网页上
+  html += "      document.getElementById('pool_val').innerText = data.pool_sticks;"; 
   html += "      isPlaying = data.is_playing;"; 
   html += "      document.getElementById('play_btn').innerText = isPlaying ? '⏸' : '▶';";
   html += "      document.getElementById('play_btn').style.background = isPlaying ? '#dc3545' : '#28a745';";
@@ -161,11 +195,33 @@ String getPageHTML() {
   html += "          document.getElementById('riichi_box_' + i).innerHTML = '';"; 
   html += "        }";
   html += "      }";
+  
+  html += "      let box = document.getElementById('console_box');";
+  html += "      let htmlStr = '';";
+  html += "      data.logs.forEach(msg => { htmlStr += '<div class=\"log-line\">' + msg + '</div>'; });";
+  html += "      if(box.innerHTML !== htmlStr) {";
+  html += "        let isAtBottom = (box.scrollHeight - box.scrollTop - box.clientHeight < 40);";
+  html += "        box.innerHTML = htmlStr;";
+  html += "        if(isAtBottom) box.scrollTop = box.scrollHeight;";
+  html += "      }";
+  
+  html += "      if(!window.audioSynced && data.audio) {";
+  html += "        document.getElementById('select_default_bgm').value = data.audio.default_bgm;";
+  html += "        for(let i=0; i<4; i++) {";
+  html += "          document.getElementById('voice_select_' + i).value = data.audio.voices[i];";
+  html += "          document.getElementById('bgm_select_' + i).value = data.audio.bgms[i];";
+  html += "        }";
+  html += "        window.audioSynced = true;";
+  html += "      }";
   html += "    });";
   html += "  }";
   html += "}, 500);";
   
-  // 音量与播放控制
+  html += "function updateAudioSetting(type, player, val) {";
+  html += "  fetch('/api/set_audio_config?type=' + type + '&player=' + player + '&val=' + val);";
+  html += "}";
+  
+  // 音量与播放控制 (带 250ms 防抖提交)
   html += "function onSliderChange(rawVal) {";
   html += "  let percent = Math.round((rawVal / 30) * 100);";
   html += "  document.getElementById('vol_percent').innerText = percent + '%';";
@@ -174,7 +230,8 @@ String getPageHTML() {
   html += "  } else {";
   html += "    if(isPlaying) { document.getElementById('play_btn').innerText = '⏸'; document.getElementById('play_btn').style.background = '#dc3545'; }";
   html += "  }";
-  html += "  fetch('/api/set_volume?val=' + rawVal);";
+  html += "  clearTimeout(volDebounceTimer);";
+  html += "  volDebounceTimer = setTimeout(function() { fetch('/api/set_volume?val=' + rawVal); }, 250);";
   html += "}";
   html += "function togglePlay() {";
   html += "  let slider = document.getElementById('vol_slider'); let currentRaw = parseInt(slider.value);";
@@ -281,6 +338,50 @@ String getPageHTML() {
   html += "  </div>";
   html += "</div>";
   
+  // 💥 🎵 4. 个人专属音效与 BGM 配置中心
+  html += "<div class='audio-panel'>";
+  html += "  <div style='font-weight:bold; color:#495057; border-bottom:1px solid #eee; padding-bottom:6px;'>🎵 个人专属音效与 BGM 配制中心</div>";
+  html += "  <div style='margin-top:10px; font-size:13px; font-weight:bold; color:#007BFF;'>";
+  html += "    常规对局 BGM (文件夹1): ";
+  html += "    <select id='select_default_bgm' class='audio-select' style='width:55%; display:inline-block; margin-left:6px;' onchange='updateAudioSetting(\"default_bgm\", 0, this.value)'>";
+  for(int m = 1; m <= 22; m++) {
+    String numStr = (m < 10) ? ("00" + String(m)) : ("0" + String(m));
+    html += "      <option value='" + String(m) + "'>曲目 " + numStr + "</option>";
+  }
+  html += "    </select>";
+  html += "  </div>";
+  html += "  <div class='audio-grid'>";
+  for(int p = 0; p < 4; p++) {
+    html += "    <div class='audio-card'>";
+    html += "      <div style='font-weight:bold; font-size:13px; color:#333;'>P" + String(p + 1) + " 自定义音效</div>";
+    html += "      <div style='font-size:11px; color:#666; margin-top:4px;'>立直人声 (文件夹2):</div>";
+    html += "      <select id='voice_select_" + String(p) + "' class='audio-select' onchange='updateAudioSetting(\"voice\", " + String(p) + ", this.value)'>";
+    for(int v = 1; v <= 7; v++) {
+      html += "        <option value='" + String(v) + "'>人声 00" + String(v) + "</option>";
+    }
+    html += "      </select>";
+    html += "      <div style='font-size:11px; color:#666; margin-top:4px;'>立直处刑曲 (文件夹3):</div>";
+    html += "      <select id='bgm_select_" + String(p) + "' class='audio-select' onchange='updateAudioSetting(\"bgm\", " + String(p) + ", this.value)'>";
+    for(int b = 1; b <= 17; b++) {
+      String numStr = (b < 10) ? ("00" + String(b)) : ("0" + String(b));
+      html += "        <option value='" + String(b) + "'>处刑曲 " + numStr + "</option>";
+    }
+    html += "      </select>";
+    html += "    </div>";
+  }
+  html += "  </div>";
+  html += "</div>";
+
+  html += "<div class='console-panel'>";
+  html += "  <div class='console-header'>";
+  html += "    <span>💻 在线实时日志终端 (Web Console)</span>";
+  html += "    <span style='font-size:11px; color:#6c757d;'>Serial 实时抓取</span>";
+  html += "  </div>";
+  html += "  <div id='console_box' class='console-box'>";
+  html += "    <div class='log-line' style='color:#888;'>[系统] 正在连接 ESP32 实时日志...</div>";
+  html += "  </div>";
+  html += "</div>";
+
   html += "<hr style='border:0; border-top:1px solid #ddd; margin:15px 0;'>";
   html += "<button class='btn' style='background:#28a745;' onclick=\"switchView('chart')\">分数走势折线图</button>";
   html += "<button class='btn' style='background:#dc3545;' onclick=\"if(confirm('确定强行荒牌过庄流局吗？')){fetch('/force_liuju');}\">流局</button>";
@@ -324,7 +425,7 @@ void initWiFiAndWeb() {
 
   server.on("/", []() { server.send(200, "text/html", getPageHTML()); });
 
-  // 0.5秒刷盘API
+  // 0.5秒刷盘API (包含大盘数据与终端日志)
   server.on("/api/get_scores", []() {
     String json = "{";
     json += "\"renchan\":" + String(renchanCounter) + ",";
@@ -333,14 +434,65 @@ void initWiFiAndWeb() {
     json += "\"mode_str\":\"" + getModeName(currentMode) + "\","; 
     json += "\"oya_idx\":" + String(currentDealer) + ","; 
     json += "\"total_hands\":" + String(totalHandsRecorded) + ","; 
-    json += "\"pool_sticks\":" + String(riichiPool) + ","; // 💥 核心新增：向手机端实时喂入当前立直池棒数
+    json += "\"pool_sticks\":" + String(riichiPool) + ","; 
     json += "\"scores\":[" + String(scores[0]) + "," + String(scores[1]) + "," + String(scores[2]) + "," + String(scores[3]) + "],";
     json += "\"ranks\":[" + String(ranks[0]) + "," + String(ranks[1]) + "," + String(ranks[2]) + "," + String(ranks[3]) + "],";
-    json += "\"riichi_states\":[" ;
+    json += "\"riichi_states\":[";
     for(int s=0; s<4; s++) { json += (hasRiichi[s] ? "true" : "false"); if(s < 3) json += ","; }
-    json += "]";
+    json += "],";
+    
+    // 💥 整合日志列表与音频配置，单个请求搞定全部同步
+    json += "\"logs\":[";
+    int startIdx = (sysLogCount < LOG_BUFFER_SIZE) ? 0 : sysLogHead;
+    for(int i = 0; i < sysLogCount; i++) {
+      int idx = (startIdx + i) % LOG_BUFFER_SIZE;
+      String escaped = sysLogBuffer[idx];
+      escaped.replace("\"", "\\\"");
+      json += "\"" + escaped + "\"";
+      if (i < sysLogCount - 1) json += ",";
+    }
+    json += "],";
+    
+    json += "\"audio\":{";
+    json += "\"default_bgm\":" + String(defaultBGMTrack) + ",";
+    json += "\"voices\":[" + String(playerVoiceTracks[0]) + "," + String(playerVoiceTracks[1]) + "," + String(playerVoiceTracks[2]) + "," + String(playerVoiceTracks[3]) + "],";
+    json += "\"bgms\":[" + String(playerBGMTracks[0]) + "," + String(playerBGMTracks[1]) + "," + String(playerBGMTracks[2]) + "," + String(playerBGMTracks[3]) + "]";
+    json += "}";
+    
     json += "}";
     server.send(200, "application/json", json); 
+  });
+
+  // 🎵 动态音频配置与实时重载 API
+  server.on("/api/set_audio_config", []() {
+    if (server.hasArg("type") && server.hasArg("val")) {
+      String type = server.arg("type");
+      int val = server.arg("val").toInt();
+      int p = server.hasArg("player") ? server.arg("player").toInt() : 0;
+      if (type == "default_bgm") {
+        defaultBGMTrack = val;
+        addLog("[🎵 音频配置] 常规对局 BGM 切换为曲目 00" + String(val));
+        if (currentAudioState == AUDIO_STATE_NORMAL_BGM) {
+          playFileInFolder(1, defaultBGMTrack); delay(50); loopCurrentTrack();
+          addLog("[⚡ 实时重载] 正处于常规 BGM 播放中，已即时重载曲目 00" + String(val));
+        }
+      } else if (type == "voice" && p >= 0 && p < 4) {
+        playerVoiceTracks[p] = val;
+        addLog("[🎵 音频配置] P" + String(p + 1) + " 立直人声自定义为 00" + String(val));
+        if (currentAudioState == AUDIO_STATE_RIICHI_VOICE && activeRiichiTrack == p) {
+          playFileInFolder(2, playerVoiceTracks[p]);
+          addLog("[⚡ 实时重载] P" + String(p + 1) + " 正在播放立直宣告人声，已即时重载语音 00" + String(val));
+        }
+      } else if (type == "bgm" && p >= 0 && p < 4) {
+        playerBGMTracks[p] = val;
+        addLog("[🎵 音频配置] P" + String(p + 1) + " 立直处刑曲自定义为 00" + String(val));
+        if (currentAudioState == AUDIO_STATE_RIICHI_BGM && activeRiichiTrack == p) {
+          playFileInFolder(3, playerBGMTracks[p]); delay(50); loopCurrentTrack();
+          addLog("[⚡ 实时重载] P" + String(p + 1) + " 正在播放处刑曲，已无缝即时重载曲目 00" + String(val));
+        }
+      }
+    }
+    server.send(200, "text/plain", "OK");
   });
 
   // 💥 核心安全升级点：无线裁判变更当前亲家庄位 API（配合前端进行强制换庄干预）
@@ -352,7 +504,7 @@ void initWiFiAndWeb() {
         updateOyaLeds();           
         resetAllRiichi();          
         updateAllSystem();         
-        Serial.println("[🌐 无线大裁判] 最高干预！当前坐庄玩家已被隔空强切为: P" + String(currentDealer + 1));
+        addLog("[🌐 无线裁判] 最高干预！当前庄家已隔空强制切换为: P" + String(currentDealer + 1));
       }
     }
     server.send(200, "text/plain", "OK");
@@ -363,14 +515,12 @@ void initWiFiAndWeb() {
     if (server.hasArg("action")) {
       String action = server.arg("action");
       if (action == "add") {
-        riichiPool++; // 立直棒无线累加一根
+        riichiPool++; 
       } else if (action == "sub") {
-        if (riichiPool > 0) riichiPool--; // 保护边界，绝对不跌破 0 变成负数呆账
+        if (riichiPool > 0) riichiPool--; 
       }
-      
-      // 💥 触发全场大盘同步。因为立直棒增减会导致账面发生变动（10万大平账安全灯会心领神会地熄灭或复燃）！
       updateAllSystem(); 
-      Serial.println("[🌐 无线大裁判] 场面留存立直棒池完成远程修正！当前公积金存量: " + String(riichiPool) + " 根");
+      addLog("[🌐 无线裁判] 立直棒池完成远程修正！当前公积金存量: " + String(riichiPool) + " 根");
     }
     server.send(200, "text/plain", "OK");
   });
@@ -381,7 +531,7 @@ void initWiFiAndWeb() {
       String action = server.arg("action");
       if (action == "add") { if (totalHandsRecorded < 32) totalHandsRecorded++; } 
       else if (action == "sub") { if (totalHandsRecorded > 1) totalHandsRecorded--; }
-      Serial.println("[🌐 无线大裁判] 手牌走势局数完成远程修正: " + String(totalHandsRecorded));
+      addLog("[🌐 无线裁判] 手牌走势局数完成远程修正: " + String(totalHandsRecorded));
     }
     server.send(200, "text/plain", "OK");
   });
@@ -396,6 +546,7 @@ void initWiFiAndWeb() {
         if (type == "add")      scores[p] += amt;
         else if (type == "sub") scores[p] -= amt;
         updateAllSystem(); 
+        addLog("[🌐 无线裁判] P" + String(p + 1) + " 隔空" + (type == "add" ? "加分" : "扣分") + " " + String(amt) + " 点");
       }
     }
     server.send(200, "text/plain", "OK");
@@ -410,6 +561,7 @@ void initWiFiAndWeb() {
       for(int i=0; i<4; i++) { extern bool isLoserSelected[4]; isLoserSelected[i] = false; }
       extern String inputBuffer; inputBuffer = "";
       updateAllSystem(); 
+      addLog("[🌐 无线裁判] 切换系统模式为: " + getModeName(currentMode));
     }
     server.send(200, "text/plain", "OK");
   });
@@ -442,8 +594,13 @@ void initWiFiAndWeb() {
       int targetVol = server.arg("val").toInt();
       if (targetVol >= 0 && targetVol <= 30) {
         systemVolume = targetVol;
-        if (systemVolume == 0) { isRiichiBGMActive = false; sendMP3Command(0x0E, 0x00, 0x00); } 
+        if (systemVolume == 0) { 
+          isRiichiBGMActive = false; 
+          currentAudioState = AUDIO_STATE_OFF;
+          sendMP3Command(0x0E, 0x00, 0x00); 
+        } 
         else { sendMP3Command(0x06, 0x00, (uint8_t)systemVolume); }
+        addLog("[🎛️ 多媒体] 系统音量调整为: " + String(systemVolume));
       }
     }
     server.send(200, "text/plain", "OK");
@@ -451,11 +608,17 @@ void initWiFiAndWeb() {
 
   // 播放翻转
   server.on("/bgm_toggle", []() {
-    if (isRiichiBGMActive) {
-      isRiichiBGMActive = false; sendMP3Command(0x0E, 0x00, 0x00); 
+    if (isRiichiBGMActive || currentAudioState != AUDIO_STATE_OFF) {
+      isRiichiBGMActive = false; 
+      currentAudioState = AUDIO_STATE_OFF;
+      sendMP3Command(0x0E, 0x00, 0x00); 
+      addLog("[🎛️ 多媒体] 暂停播放背景音乐");
     } else {
       if (systemVolume == 0) { systemVolume = 6; sendMP3Command(0x06, 0x00, (uint8_t)systemVolume); }
-      playFileInFolder(1, 2); delay(50); loopCurrentTrack(); isRiichiBGMActive = true;
+      playFileInFolder(1, defaultBGMTrack); delay(50); loopCurrentTrack(); 
+      isRiichiBGMActive = true;
+      currentAudioState = AUDIO_STATE_NORMAL_BGM;
+      addLog("[🎛️ 多媒体] 开始/恢复播放背景音乐");
     }
     server.send(200, "text/plain", "OK");
   });
@@ -464,6 +627,7 @@ void initWiFiAndWeb() {
   server.on("/force_liuju", []() {
     renchanCounter = 0; currentDealer = (currentDealer + 1) % 4; 
     updateOyaLeds(); resetAllRiichi(); updateAllSystem();
+    addLog("[🌐 无线裁判] 强行触发荒牌过庄流局！连庄重置，庄位切至 P" + String(currentDealer + 1));
     server.send(200, "text/plain", "OK");
   });
 
