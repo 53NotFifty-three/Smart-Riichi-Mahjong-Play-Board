@@ -1,5 +1,6 @@
 // =========================================================================
-// 🌐 独立标签页：web_server.h (立直池无线微调、常亮红字与换届二次确认防误触版)
+// 🌐 网页服务器与无线控制终端模块：web_server.h
+// 功能：提供 Web 控制界面、RESTful API、局势图表与音效自定义
 // =========================================================================
 #ifndef WEB_SERVER_H
 #define WEB_SERVER_H
@@ -7,36 +8,40 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
+// =========================================================================
+// 1. 网络热点配置与外部固件变量引用
+// =========================================================================
 const char* wifi_ssid     = "Fish&53"; 
 const char* wifi_password = "Dd@20040923";   
 
 extern WebServer server; 
 
-// 外部依赖变量声明
+// 固件核心状态变量引用
 extern int renchanCounter;
 extern int currentDealer;
 extern long scores[4];
 extern int ranks[4];
 extern Mode currentMode; 
+extern bool isGameActive; 
 
-// 音轨自定义配置及实时播放状态追踪变量引用
+// 音轨自定义配置及实时播放状态追踪引用
 extern uint8_t playerVoiceTracks[4];
 extern uint8_t playerBGMTracks[4];
 extern uint8_t defaultBGMTrack;
 extern AudioState currentAudioState;
 extern int activeRiichiTrack;
 
-// 引入核心霍尔立直物理锁定状态数组和公积金池变量声明
+// 霍尔传感器立直状态与公积金池引用
 extern bool hasRiichi[4]; 
-extern int riichiPool; // 💥 引入全局立直棒池
+extern int riichiPool;
 
-// 历史记录与 MH2024K 原生音量全局声明
+// 历史快照与系统主音量引用
 extern long scoreHistory[32][4];
 extern int dealerHistory[32];
 extern int totalHandsRecorded;
 extern int systemVolume; 
 
-// MH2024K 原生 HEX 驱动引擎外部函数引用
+// MP3 音频底层驱动函数引用
 extern void sendMP3Command(uint8_t cmd, uint8_t para1, uint8_t para2);
 extern void playFileInFolder(uint8_t folder, uint8_t fileIdx);
 extern void loopCurrentTrack();
@@ -47,7 +52,9 @@ extern void resetAllRiichi();
 extern void updateAllSystem();
 extern String getModeName(Mode mode); 
 
-// 🌐 系统日志缓冲区与在线 Console 引擎
+// =========================================================================
+// 2. 实时日志系统与在线终端 Console 缓冲区
+// =========================================================================
 #define LOG_BUFFER_SIZE 30
 String sysLogBuffer[LOG_BUFFER_SIZE];
 int sysLogHead = 0;
@@ -60,7 +67,9 @@ void addLog(String msg) {
   if (sysLogCount < LOG_BUFFER_SIZE) sysLogCount++;
 }
 
-// 💥 网页综合模板
+// =========================================================================
+// 3. Web HTML / CSS / JS 动态前端构建引擎
+// =========================================================================
 String getPageHTML() {
   String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'>";
   html += "<meta name='viewport' content='width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover'>";
@@ -175,7 +184,7 @@ String getPageHTML() {
   html += "    fetch('/api/get_scores').then(r => r.json()).then(data => {";
   html += "      document.getElementById('renchan_val').innerText = data.renchan;";
   html += "      document.getElementById('mode_val').innerText = data.mode_str;"; 
-  html += "      document.getElementById('hands_val').innerText = data.total_hands;"; 
+  html += "      document.getElementById('hands_val').innerText = data.renchan;"; 
   html += "      document.getElementById('pool_val').innerText = data.pool_sticks;"; 
   html += "      isPlaying = data.is_playing;"; 
   html += "      document.getElementById('play_btn').innerText = isPlaying ? '⏸' : '▶';";
@@ -321,7 +330,7 @@ String getPageHTML() {
   
   // 局数微调行
   html += "  <div class='setup-flex' style='margin-top:12px; border-top:1px dashed #eee; padding-top:8px;'>";
-  html += "    <div style='font-size:13px; color:#495057; font-weight:bold;'>折线图手牌局数: <span id='hands_val' style='color:#fd7e14;'>1</span> 局</div>";
+  html += "    <div style='font-size:13px; color:#495057; font-weight:bold;'>当前连庄本场数: <span id='hands_val' style='color:#fd7e14;'>0</span> 场</div>";
   html += "    <div style='display:flex; gap:6px;'>";
   html += "      <button class='setup-sub-btn' style='padding:5px 15px; font-size:16px;' onclick=\"adjustHandCount('sub')\">-</button>";
   html += "      <button class='setup-sub-btn' style='padding:5px 15px; font-size:16px; background:#fd7e14; color:white;' onclick=\"adjustHandCount('add')\">+</button>";
@@ -413,6 +422,9 @@ String getPageHTML() {
   return html;
 }
 
+// =========================================================================
+// 4. HTTP API 路由与异步事件监听器初始化
+// =========================================================================
 void initWiFiAndWeb() {
   Serial.println("\n[🌐 WiFi 引擎] 正在尝试连接路由器: " + String(wifi_ssid));
   WiFi.begin(wifi_ssid, wifi_password);
@@ -525,13 +537,18 @@ void initWiFiAndWeb() {
     server.send(200, "text/plain", "OK");
   });
 
-  // 无线局数修正
+  // 无线连庄本场数修正
   server.on("/api/adjust_hands", []() {
     if (server.hasArg("action")) {
       String action = server.arg("action");
-      if (action == "add") { if (totalHandsRecorded < 32) totalHandsRecorded++; } 
-      else if (action == "sub") { if (totalHandsRecorded > 1) totalHandsRecorded--; }
-      addLog("[🌐 无线裁判] 手牌走势局数完成远程修正: " + String(totalHandsRecorded));
+      if (action == "add") { 
+        renchanCounter++; 
+      } 
+      else if (action == "sub") { 
+        if (renchanCounter > 0) renchanCounter--; 
+      }
+      updateAllSystem();
+      addLog("[🌐 无线裁判] 连庄本场数完成远程修正: " + String(renchanCounter) + " 场");
     }
     server.send(200, "text/plain", "OK");
   });
@@ -626,8 +643,11 @@ void initWiFiAndWeb() {
   // 流局过庄
   server.on("/force_liuju", []() {
     renchanCounter = 0; currentDealer = (currentDealer + 1) % 4; 
+    isGameActive = false; 
+    sendMP3Command(0x16, 0x00, 0x00); 
+    currentAudioState = AUDIO_STATE_OFF;
     updateOyaLeds(); resetAllRiichi(); updateAllSystem();
-    addLog("[🌐 无线裁判] 强行触发荒牌过庄流局！连庄重置，庄位切至 P" + String(currentDealer + 1));
+    addLog("[🌐 无线裁判] 强行触发荒牌过庄流局！连庄重置，系统进入待机状态，庄位切至 P" + String(currentDealer + 1));
     server.send(200, "text/plain", "OK");
   });
 

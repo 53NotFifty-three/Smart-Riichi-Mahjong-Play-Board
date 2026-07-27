@@ -1,70 +1,72 @@
 #include "Arduino.h"
-#include "PCF8575.h"              // PCF8575 库
-#include <Wire.h>                 // Wire 库
-#include <TM1637Display.h> 
+#include "PCF8575.h"              // PCF8575 I2C 扩展芯片库
+#include <Wire.h>                 // Wire I2C 通信库
+#include <TM1637Display.h>        // TM1637 数码管驱动库
 
-// === 1. 游戏状态机模式定义 ===
+// =========================================================================
+// 1. 系统模式与状态定义
+// =========================================================================
 enum Mode { MODE_IDLE, MODE_TRANSFER, MODE_MANUAL_ADD, MODE_MANUAL_SUB };
-Mode currentMode = MODE_IDLE;
+Mode currentMode = MODE_IDLE; // 当前系统运行模式
 
-// === 2. 引脚与地址定义 ===
-#define I2C_SDA 13
-#define I2C_SCL 14
-#define PCF8575_ADDRESS 0x20  
+enum AudioState { AUDIO_STATE_OFF, AUDIO_STATE_NORMAL_BGM, AUDIO_STATE_RIICHI_VOICE, AUDIO_STATE_RIICHI_BGM };
+AudioState currentAudioState = AUDIO_STATE_OFF; // 音频播放状态机追踪
 
-#define FPSERIAL Serial2 
+// =========================================================================
+// 2. 引脚与硬件地址定义
+// =========================================================================
+#define I2C_SDA 13                // I2C 数据引脚
+#define I2C_SCL 14                // I2C 时钟引脚
+#define PCF8575_ADDRESS 0x20      // PCF8575 芯片 I2C 设备地址
 
-#define TM_CLK 22 
-const uint8_t tmDIO[4] = {21, 19, 18, 5}; 
+#define FPSERIAL Serial2          // MP3 音频芯片串口绑定
+#define TM_CLK 22                 // 4 路数码管共享的 CLK 引脚
+const uint8_t tmDIO[4] = {21, 19, 18, 5}; // 4 路数码管独立的 DIO 引脚
 
-// 🔥 三麻/四麻物理选择开关引脚（ESP32原生引脚）
+// 三麻/四麻物理模式选择开关引脚（ESP32 原生 GPIO）
 #define PIN_3PLAYER 2
 #define PIN_4PLAYER 15
 
-// === 4路霍尔传感器引脚定义 ===
-const uint8_t hallPins[4] = {26, 27, 33, 25};
+// 4 路霍尔传感器引脚定义（东、南、西、北）
+const uint8_t hallPins[4] = {33, 25, 26, 27};
 
-// 霍尔状态变量（用于瞬间边沿触发检测）
+// 霍尔传感器状态记录（用于瞬间下降沿边沿触发检测）
 bool lastHallState[4] = {false, false, false, false};
 
-// 立直局内锁定状态：true 代表本局已立直过，锁死不再扣分
-bool hasRiichi[4] = {false, false, false, false}; 
+// 局内立直锁定状态：true 代表本局已立直，锁死不再重复扣分
+bool hasRiichi[4] = {false, false, false, false};
 
-// === 💥 日麻核心算法变量 ===
-int currentDealer = 0;               // 核心指针：当前哪位物理玩家是“东家”(0->P1, 1->P2, 2->P3, 3->P4)
-int renchanCounter = 0;              // 核心变量：连庄数（本场数）
-bool isFirstHand = true;             // 核心变量：是否为开机后的第一局
+// =========================================================================
+// 3. 日本麻将核心算法变量
+// =========================================================================
+int currentDealer = 0;               // 核心指针：当前物理东家/庄家 (0->P1, 1->P2, 2->P3, 3->P4)
+int renchanCounter = 0;              // 连庄数 / 本场棒数
+bool isFirstHand = true;             // 是否为开机后的第一局
 
-unsigned long diceDisplayTimer = 0; 
-int lastDiceResult = 0;             
-int targetPlayerIdx = -1;           
+unsigned long diceDisplayTimer = 0;  // 骰子点数显示定时器
+int lastDiceResult = 0;              // 最近一次随机掷骰结果 (2-12)
+int targetPlayerIdx = -1;            // 骰子开门指向的目标摸牌玩家索引
 
-// === 3麻/4麻全局控制变量 ===
+// 3麻/4麻运行控制变量
 bool is3PlayerMode = false;          // 是否为三人麻将模式
-bool isPlayerPresent[4] = {true, true, true, true}; // 控制 4 个方位的有效性参与（3麻第一局后会单独扣掉第4方）
+bool isPlayerPresent[4] = {true, true, true, true}; // 控制 4 个方位的参与有效性
 
-// === 转账动态闪烁与非阻塞守卫变量 ===
-unsigned long lastBlinkTime = 0;    
-bool blinkState = true;             
+// 动态显示与超时保护守卫变量
+unsigned long lastBlinkTime = 0;     // 得分卡片与转账闪烁定时器
+bool blinkState = true;              // 闪烁状态位
+unsigned long inputTimeoutTimer = 0;  // 键盘输入 5 秒超时定时器
 
-// === 键盘输入全流程5秒超时守卫变量 ===
-unsigned long inputTimeoutTimer = 0; 
+// 全局音量与音频状态变量
+int systemVolume = 30;               // 系统主音量 (0-30)
+int activeRiichiTrack = -1;          // 当前触发立直的玩家座位索引
+bool isRiichiBGMActive = false;      // 处刑曲播放激活标志
+unsigned long audioRestoreTimer = 0;  // 立直宣告人声过渡到处刑曲的时钟
 
-// === 全局音量与物理绝对线序音频变量 ===
-int systemVolume = 20;               
-int defaultBGM = 12;                 
+bool isGameActive = false;           // 防误触核心全局游戏激活标志锁
 
-enum AudioState { AUDIO_STATE_OFF, AUDIO_STATE_NORMAL_BGM, AUDIO_STATE_RIICHI_VOICE, AUDIO_STATE_RIICHI_BGM };
-AudioState currentAudioState = AUDIO_STATE_OFF;
-
-int activeRiichiTrack = -1;          
-bool isRiichiBGMActive = false;      
-unsigned long audioRestoreTimer = 0; 
-
-// === 防误触核心全局状态锁 ===
-bool isGameActive = false;           
-
-// === 3. 实例初始化 ===
+// =========================================================================
+// 4. 外设实例与数码管段码定义
+// =========================================================================
 PCF8575 pcf8575(PCF8575_ADDRESS);
 TM1637Display displays[4] = {
   TM1637Display(TM_CLK, tmDIO[0]), 
@@ -73,32 +75,35 @@ TM1637Display displays[4] = {
   TM1637Display(TM_CLK, tmDIO[3])  
 };
 
-// === 4. 数码管特殊字符与段码定义 ===
-const uint8_t SEG_BLANK = 0x00;
-const uint8_t SEG_MINUS = 0x40; 
+// 数码管特殊字符与数字段码 (TM1637 编码)
+const uint8_t SEG_BLANK = 0x00;      // 熄灭/空白
+const uint8_t SEG_MINUS = 0x40;      // 负号 "-"
 const uint8_t SEG_NUMBER[] = {
-  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F 
+  0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F // 0~9 数字段码
 };
 
-// === 5. 游戏计分系统核心变量 ===
-long scores[4] = {25000, 25000, 25000, 25000};
-int totalsum = 100000;
-int ranks[4] = {1, 1, 1, 1};
+// =========================================================================
+// 5. 计分系统与历史快照存储
+// =========================================================================
+long scores[4] = {25000, 25000, 25000, 25000}; // 4 家实时点数
+int totalsum = 100000;                        // 总分（4人10万点，3人10.5万点）
+int ranks[4] = {1, 1, 1, 1};                  // 4 家实时顺位排名
 
-// === 🀄 立直棒供托核心变量 ===
-int riichiPool = 0;              // 场面上当前累积的立直棒总数（每根代表1000点）
-bool isRiichi[4] = {false, false, false, false}; // 记录本局有谁拍出了立直棒
+int riichiPool = 0;                            // 场面上累积的立直棒存量 (每根 1000 点)
+bool isRiichi[4] = {false, false, false, false};
 
-// === 📈 历史走势内存存储变量 ===
-#define MAX_HANDS 32              // 最大支持记录32局走势
-long scoreHistory[MAX_HANDS][4];  // 存放每局结束时4位玩家的分数快照
-int dealerHistory[MAX_HANDS];     // 存放每局对应的东家物理索引(0-3)
-int totalHandsRecorded = 0;       // 当前已经记录的局数计数器
+#define MAX_HANDS 32                          // 最大历史记录局数
+long scoreHistory[MAX_HANDS][4];              // 局末分数快照历史表
+int dealerHistory[MAX_HANDS];                 // 局末庄家索引历史表
+int totalHandsRecorded = 0;                   // 已记录的总局数计数器
 
-bool isLoserSelected[4] = {false, false, false, false}; 
-String inputBuffer = "";
+bool isLoserSelected[4] = {false, false, false, false}; // 转账模式下的输家点选状态
+String inputBuffer = "";                      // 键盘输入数字缓冲区
 
-// === 6. 4x4 键盘矩阵映射表 ===
+// =========================================================================
+// 6. 物理硬件映射 (键盘矩阵 / 骰子按键 / LED灯)
+// =========================================================================
+// 4x4 键盘矩阵映射表 ('+' 键支持 2 秒内复按切换加减分，原 '-' 键留空)
 char keyMap[4][4] = {
   {'E', '3', '2', '1'}, 
   {'S', '6', '5', '4'}, 
@@ -106,14 +111,14 @@ char keyMap[4][4] = {
   {'N', '\0', '0', '+'}   
 };
 
-// === 7. 最终确定的按键与灯光物理引脚映射 ===
-const uint8_t btnPins[4] = {14, 12, 10, 8}; 
-const uint8_t ledPins[4] = {15, 13, 11, 9}; 
+// PCF8575 引脚绑定：按键信号输入与庄家指示灯控制
+const uint8_t btnPins[4] = {14, 12, 10, 8};  // 玩家大按键输入脚
+const uint8_t ledPins[4] = {15, 13, 11, 9};  // 庄家指示灯输出脚
+bool lastBtnState[4] = {false, false, false, false}; // 大按键电平守卫
 
-// 按键状态记忆守卫变量（默认为false低电平）
-bool lastBtnState[4] = {false, false, false, false}; 
-
-// 函数预声明
+// =========================================================================
+// 7. 函数前置声明
+// =========================================================================
 char scanKeypad();
 void handleKey(char key);
 int getPlayerIndex(char key);
@@ -133,24 +138,24 @@ void hardResetMP3ToNormal();
 void addLog(String msg); 
 
 // =========================================================================
-// 🔊 MH2024K 芯片专属底层原始 HEX 串驱动引擎
+// 8. MH2024K 音频芯片 HEX 串口底层驱动引擎
 // =========================================================================
 void sendMP3Command(uint8_t cmd, uint8_t para1, uint8_t para2) {
   uint8_t msg[10];
-  msg[0] = 0x7E; 
-  msg[1] = 0xFF; 
-  msg[2] = 0x06; 
-  msg[3] = cmd;  
-  msg[4] = 0x00; 
-  msg[5] = para1;
-  msg[6] = para2;
+  msg[0] = 0x7E; // 帧头
+  msg[1] = 0xFF; // 版本
+  msg[2] = 0x06; // 长度
+  msg[3] = cmd;  // CMD 指令
+  msg[4] = 0x00; // 是否反馈 (0x00=否)
+  msg[5] = para1;// 参数1 (文件夹号)
+  msg[6] = para2;// 参数2 (曲目号)
   
   uint16_t sum = msg[1] + msg[2] + msg[3] + msg[4] + msg[5] + msg[6];
-  uint16_t checksum = ~sum + 1;
+  uint16_t checksum = ~sum + 1; // 动态计算校验和
   
   msg[7] = (uint8_t)(checksum >> 8);   
   msg[8] = (uint8_t)(checksum & 0xFF); 
-  msg[9] = 0xEF; 
+  msg[9] = 0xEF; // 帧尾
 
   FPSERIAL.write(msg, 10);
   delay(30); 
@@ -161,7 +166,7 @@ void playFileInFolder(uint8_t folder, uint8_t fileIdx) {
 }
 
 void loopCurrentTrack() {
-  sendMP3Command(0x19, 0x00, 0x00); // 💥【硬件BUG修复】使用 0x19 指令开启当前播放曲目的单曲循环（取代原先误播1号曲目的 0x08 帧）
+  sendMP3Command(0x19, 0x00, 0x00); // 0x19 帧实现当前曲目单曲循环
 }
 
 // 全局可控音频轨道配置
@@ -169,7 +174,7 @@ uint8_t playerVoiceTracks[4] = {1, 3, 4, 7}; // 4家立直人声 (文件夹2)
 uint8_t playerBGMTracks[4]   = {1, 2, 3, 4}; // 4家处刑曲 (文件夹3)
 uint8_t defaultBGMTrack       = 2;            // 常规对局BGM (文件夹1)
 
-// 冲阻清洗重置音频引擎
+// 冲阻清洗与常规 BGM 重置引擎
 void hardResetMP3ToNormal() {
   sendMP3Command(0x16, 0x00, 0x00); delay(50);  // 停止当前播放
   playFileInFolder(1, defaultBGMTrack); delay(120); // 播放文件夹1的对局BGM
@@ -178,48 +183,40 @@ void hardResetMP3ToNormal() {
 }
 
 // =========================================================================
-// 💥 将外部网页服务包含放在所有全局变量声明之下
+// 9. 网页服务模块包含 (需放在所有全局变量声明之下)
 // =========================================================================
 #include "web_server.h" 
 WebServer server(80);   
 
+// =========================================================================
+// 10. ESP32 系统初始化函数 (setup)
+// =========================================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n========================================================");
-  Serial.println("    键盘&BGM&计分&骰子&霍尔立直系统固件（无冲突完美回归版）");
+  Serial.println("    键盘&BGM&计分&骰子&霍尔立直系统固件（全网联网精炼版）");
   Serial.println("========================================================");
 
-  // 物理模式开关读取 (已暂时注释三麻检测，默认强制四人麻将模式)
+  // 物理模式开关读取 (已固定为四人麻将模式)
   pinMode(PIN_3PLAYER, INPUT_PULLDOWN);
   pinMode(PIN_4PLAYER, INPUT_PULLDOWN);
   delay(50);
 
-  /*
-  if (digitalRead(PIN_3PLAYER) == HIGH && digitalRead(PIN_4PLAYER) == LOW) {
-    is3PlayerMode = true;
-    totalsum = 105000;
-    for(int i = 0; i < 4; i++) {
-      scores[i] = 35000;
-      isPlayerPresent[i] = true; // 💥【核心修正】三人麻将开机初期全部强制亮起！不进入繁琐的选座！
-    }
-    Serial.println("【🀄 开机模式】-> 检测到硬件开关处于：三人麻将模式（开局满员，第一局后扣除第4家）");
-  } else 
-  */
-  {
-    is3PlayerMode = false;
-    totalsum = 100000;
-    for(int i = 0; i < 4; i++) {
-      scores[i] = 25000;
-      isPlayerPresent[i] = true;
-    }
-    Serial.println("【🀄 开机模式】-> 已固定为：四人麻将模式");
+  is3PlayerMode = true;
+  totalsum = 105000;
+  for(int i = 0; i < 4; i++) {
+    scores[i] = (i < 3) ? 35000 : 0;
+    isPlayerPresent[i] = (i < 3) ? true : false;
   }
+  Serial.println("【🀄 开机模式】-> 已固定为：三人麻将模式");
 
+  // 数码管显示屏亮度配置
   for(int i = 0; i < 4; i++) {
     displays[i].setBrightness(4, true); 
   }
 
+  // 音频串口与 I2C 芯片扩展器初始化
   FPSERIAL.begin(9600, SERIAL_8N1, 16, 17); 
   delay(100);
   
@@ -230,11 +227,16 @@ void setup() {
   Wire.begin(I2C_SDA, I2C_SCL); 
   if (pcf8575.begin(0xFFFF)) { 
     Serial.println("【⌨️ 芯片配置】-> PCF8575 扩展芯片初始化成功！");
+    // 💥【核心硬件冲突修复】因为 pcf8575.begin() 底层会调用 Wire.begin() 误将 I2C 重新绑定回默认的 21/22 引脚，
+    // 从而锁死共享同一引脚的东/南数码管（21/22）并导致指示灯控制信号出错。
+    // 因此在初始化 PCF8575 成功后，必须立即重新调用 Wire.begin 将 I2C 重定向回 13/14 引脚，释放 21/22 供数码管驱动！
+    Wire.begin(I2C_SDA, I2C_SCL);
   } else {
     Serial.println("【❌ 核心错误】-> 未找到 PCF8575 芯片，系统挂起！");
     while(1); 
   }
 
+  // 霍尔传感器与乱数种子配置
   for(int i = 0; i < 4; i++) {
     pinMode(hallPins[i], INPUT_PULLUP);              
     lastHallState[i] = (digitalRead(hallPins[i]) == LOW); 
@@ -249,12 +251,12 @@ void setup() {
   updateOyaLeds(); 
   updateAllSystem();
 
-  // 写入第0局初始分快照
+  // 记录第 0 局初始分快照
   for(int i=0; i<4; i++) scoreHistory[0][i] = scores[i];
   dealerHistory[0] = currentDealer;
   totalHandsRecorded = 1; 
 
-  // 开机引脚硬件电平高精度净化
+  // 硬件电平初态预读
   for (int i = 0; i < 4; i++) {
     pcf8575.write(btnPins[i], 1); 
   }
@@ -266,10 +268,13 @@ void setup() {
   initWiFiAndWeb(); 
 }
 
+// =========================================================================
+// 11. 主循环与轮询逻辑 (loop)
+// =========================================================================
 void loop() {
   updateOyaLeds();
 
-  // 音频状态机：负责截断真人语音并高燃接入处刑曲单曲循环
+  // 音频状态机：立直宣告真人语音结束 2.5s 后接入处刑曲单曲循环
   if (audioRestoreTimer != 0) {
     if (millis() - audioRestoreTimer >= 2500) { 
       audioRestoreTimer = 0; 
@@ -277,18 +282,13 @@ void loop() {
       currentAudioState = AUDIO_STATE_RIICHI_BGM;
       
       uint8_t targetBGM = playerBGMTracks[activeRiichiTrack];
-      Serial.println("\n----------------------------------------------------");
-      Serial.print("[🔊 音频状态机] 真人语音宣告退场。正在无缝突入座位 ");
-      Serial.print(activeRiichiTrack + 1);
-      Serial.println(" 专属处刑曲，曲目号: " + String(targetBGM));
-      
       playFileInFolder(3, targetBGM); 
       delay(50);
       loopCurrentTrack(); 
-      Serial.println("----------------------------------------------------");
     }
   }
 
+  // 5秒键盘输入超时超时守护拦截
   if (currentMode != MODE_IDLE) {
     if (millis() - inputTimeoutTimer >= 5000) {
       clearTransferBuffer(); 
@@ -297,6 +297,7 @@ void loop() {
     }
   }
 
+  // 转账模式下的得失卡片动态闪烁控制
   if (millis() - lastBlinkTime >= 250) {
     lastBlinkTime = millis();
     blinkState = !blinkState;
@@ -307,6 +308,7 @@ void loop() {
     }
   }
 
+  // 掷骰点数数码管暂留计时器 (2秒)
   if (diceDisplayTimer != 0) {
     if (millis() - diceDisplayTimer >= 2000) {
       diceDisplayTimer = 0;
@@ -314,10 +316,9 @@ void loop() {
     }
   }
 
+  // 物理键盘矩阵扫描与事件响应
   char pressedKey = scanKeypad(); 
   if (pressedKey != '\0') {
-    Serial.println("\n------------------------------------");
-    Serial.println("[⌨️ 键盘扫描] 物理按键触发: '" + String(pressedKey) + "'");
     handleKey(pressedKey);
     delay(200); 
   }
@@ -326,7 +327,7 @@ void loop() {
   scanHallSensors();
   handleWiFiClient(); 
 
-  // 智能换局数据流历史存盘哨兵
+  // 历史打点数据快照自动哨兵
   static int lastRenchan = 0;       
   static int lastDealer = 0;        
   bool roundEnded = false;           
@@ -335,7 +336,6 @@ void loop() {
   if (currentDealer != lastDealer)   { roundEnded = true; lastDealer = currentDealer; }
 
   if (roundEnded) {
-    Serial.println("\n[🔍 哨兵截获] 监测到庄位更替或连庄结算，确认换局！正在追加历史快照...");
     if (totalHandsRecorded < MAX_HANDS) {
       for (int i = 0; i < 4; i++) {
         scoreHistory[totalHandsRecorded][i] = scores[i]; 
@@ -349,9 +349,12 @@ void loop() {
   delay(10);
 }
 
+// =========================================================================
+// 12. 硬件控制与物理按键扫描逻辑
+// =========================================================================
 void updateOyaLeds() {
   for (int i = 0; i < 4; i++) {
-    // 庄家且该方位正常存在时亮灯，其余一律熄灭
+    // 庄家点亮指示灯 (写 0)，闲家熄灭 (写 1)
     pcf8575.write(ledPins[i], (i == currentDealer && isPlayerPresent[i]) ? 0 : 1);
   }
 }
@@ -365,7 +368,6 @@ void scanDiceButtons() {
     return;
   }
 
-  // 算出下一个有效的闲家候选人（3麻自动越过空方3）
   int nextDealerCandidate = (currentDealer + 1) % 4; 
   while (!isPlayerPresent[nextDealerCandidate]) {
     nextDealerCandidate = (nextDealerCandidate + 1) % 4;
@@ -375,7 +377,7 @@ void scanDiceButtons() {
   delayMicroseconds(10); 
 
   for (int i = 0; i < 4; i++) {
-    if (!isPlayerPresent[i]) continue; // 💥 如果该方位已经被关闭，按钮直接死锁拦截
+    if (!isPlayerPresent[i]) continue; 
 
     int rawReading = pcf8575.read(btnPins[i]);
     bool currentReading = (rawReading == 0);
@@ -391,11 +393,9 @@ void scanDiceButtons() {
             renchanCounter++; 
             resetAllRiichi();
             shouldTriggerMusic = true; 
-    
             addLog("[🎲 骰子开局] 庄家 (P" + String(i+1) + ") 重复开局！本场数递增为: " + String(renchanCounter));
           } 
           else {
-            // 💥【核心升级点】：第一局大按钮正式被按下，游戏激活的瞬间！
             isFirstHand = false;
             shouldTriggerMusic = true; 
             
@@ -426,7 +426,6 @@ void scanDiceButtons() {
         targetPlayerIdx = getTargetPlayerByDice(lastDiceResult);
         addLog("[🎲 掷骰开门] 摇出点数: " + String(lastDiceResult) + " 点，开门位: P" + String(targetPlayerIdx+1));
         
-        // 💥三麻开门保护：如果骰子算出来的目标摸牌位是空方，顺延到有人的有效下家
         while (!isPlayerPresent[targetPlayerIdx]) {
           targetPlayerIdx = (targetPlayerIdx + 1) % 4;
         }
@@ -455,16 +454,19 @@ int getTargetPlayerByDice(int dice) {
   return (currentDealer + relativeIdx) % 4;
 }
 
+// =========================================================================
+// 13. 霍尔立直传感器逻辑 (下降沿边沿触发)
+// =========================================================================
 void scanHallSensors() {
   if (!isGameActive) return; 
 
   for (int i = 0; i < 4; i++) {
-    if (!isPlayerPresent[i]) continue; // 💥 三麻关闭北家后，不再触发他的霍尔立直扣分检测
+    if (!isPlayerPresent[i]) continue; 
 
     bool currentReading = (digitalRead(hallPins[i]) == LOW); 
     if (hasRiichi[i]) { lastHallState[i] = currentReading; continue; }
 
-    // 💥【硬件上拉优化】移除 1000ms 延时检测，改为磁吸瞬间边沿触发（零延迟触发立直）
+    // 磁吸瞬间下降沿触发 (零延迟触发立直)
     if (currentReading && !lastHallState[i]) { 
       hasRiichi[i] = true; 
       
@@ -502,12 +504,15 @@ void clearTransferBuffer() {
   inputBuffer = "";
 }
 
+// =========================================================================
+// 14. 4x4 矩阵键盘解析与日麻转账结算状态机
+// =========================================================================
 void handleKey(char key) {
   inputTimeoutTimer = millis(); 
   int pIdx = getPlayerIndex(key);
   
   if (pIdx != -1) {
-    if (!isPlayerPresent[pIdx]) return; // 💥 三麻关闭方键盘按键死锁拦截，按了也没有任何作用
+    if (!isPlayerPresent[pIdx]) return; 
 
     if (currentMode == MODE_IDLE || (currentMode == MODE_TRANSFER && inputBuffer.length() == 0)) {
       currentMode = MODE_TRANSFER;
@@ -522,19 +527,32 @@ void handleKey(char key) {
         clearTransferBuffer(); currentMode = MODE_IDLE; updateAllSystem(); return;
       }
 
-      long baseVal = inputBuffer.toInt() * 100; 
+      long baseVal = inputBuffer.toInt(); 
       long totalWinSum = 0;                    
       bool isDealerWinner = (pIdx == currentDealer);
 
       for (int i = 0; i < 4; i++) {
         if (isLoserSelected[i] && isPlayerPresent[i]) {
           long actualDeduct = baseVal; 
-          if (loserCount > 1 && i == currentDealer) {
-            actualDeduct = baseVal * 2; 
+          
+          // 💥【日麻标准本场棒分配规则】
+          if (loserCount > 1) {
+            // 1. 自摸情况：若该输家为当前庄家，需支付双倍基础分
+            if (i == currentDealer) {
+              actualDeduct = baseVal * 2; 
+            } 
+            // 自摸时其余各家平分支付本场点：每位输家各支付 100 * renchanCounter
+            if (renchanCounter > 0) {
+              actualDeduct += (100 * renchanCounter);
+            }
           } 
-          if (i == currentDealer && renchanCounter > 0) {
-            actualDeduct += (300 * renchanCounter);
+          else {
+            // 2. 荣和/放铳情况：由放铳单家全额包揽支付本场点 (三麻 200/本场，四麻 300/本场)
+            if (renchanCounter > 0) {
+              actualDeduct += ((is3PlayerMode ? 200 : 300) * renchanCounter);
+            }
           }
+          
           scores[i] -= actualDeduct;    
           totalWinSum += actualDeduct; 
         }
@@ -553,13 +571,14 @@ void handleKey(char key) {
       } else {
         renchanCounter = 0;  
         currentDealer = (currentDealer + 1) % 4; 
-        // 三麻下庄轮流自动跨越空方3
         while (!isPlayerPresent[currentDealer]) {
           currentDealer = (currentDealer + 1) % 4;
         }
       }
 
-      hardResetMP3ToNormal();
+      isGameActive = false; 
+      sendMP3Command(0x16, 0x00, 0x00); // 💥【结算机制优化】和牌结算成功，当前局结束，系统回到待机状态并关闭背景音，等待掷骰开局
+      currentAudioState = AUDIO_STATE_OFF;
 
       updateOyaLeds(); 
       resetAllRiichi(); 
@@ -571,7 +590,7 @@ void handleKey(char key) {
     }
     else if (currentMode == MODE_MANUAL_ADD || currentMode == MODE_MANUAL_SUB) {
       if (inputBuffer.length() > 0) {
-        long val = inputBuffer.toInt() * 100; 
+        long val = inputBuffer.toInt(); 
         bool isAdd = (currentMode == MODE_MANUAL_ADD);
         if (isAdd) scores[pIdx] += val;
         else       scores[pIdx] -= val;
@@ -584,10 +603,8 @@ void handleKey(char key) {
   else if (key == '+') {
     static unsigned long lastPlusPressTime = 0;
     if ((currentMode == MODE_MANUAL_ADD || currentMode == MODE_MANUAL_SUB) && (millis() - lastPlusPressTime < 2000)) {
-      // 2秒内再次按下，在加分与减分模式之间切换
       currentMode = (currentMode == MODE_MANUAL_ADD) ? MODE_MANUAL_SUB : MODE_MANUAL_ADD;
     } else {
-      // 首次按下或超过2秒，默认进入强行加分模式
       currentMode = MODE_MANUAL_ADD;
       inputBuffer = "";
     }
@@ -623,9 +640,12 @@ String getModeName(Mode mode) {
   return "【强行减分微调模式】";
 }
 
+// =========================================================================
+// 15. 数码管显示渲染与顺位算法
+// =========================================================================
 void calculateRanks() {
   for (int i = 0; i < 4; i++) {
-    if (!isPlayerPresent[i]) { ranks[i] = 4; continue; } // 空方默认排第 4 顺位
+    if (!isPlayerPresent[i]) { ranks[i] = 4; continue; } 
     int r = 1;
     for (int j = 0; j < 4; j++) {
       if (isPlayerPresent[j] && scores[j] > scores[i]) r++; 
@@ -641,7 +661,7 @@ void updateAllSystem() {
 }
 
 void updateSingleDisplay(int playerIdx) {
-  // 💥【核心新增：物理灭屏门闩】当第一局开启后，被关闭的空玩家座位（playerIdx == 3）全屏彻底变黑！
+  Serial.printf("[DEBUG Display] playerIdx: %d, present: %d, score: %ld, rank: %d\n", playerIdx, isPlayerPresent[playerIdx], scores[playerIdx], ranks[playerIdx]);
   if (!isPlayerPresent[playerIdx]) {
     uint8_t blankData[6] = { SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK, SEG_BLANK };
     displays[playerIdx].setSegments(blankData, 6, 0);
